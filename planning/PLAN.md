@@ -454,3 +454,61 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review: Questions, Clarifications & Simplification Opportunities
+
+### Questions & Clarifications
+
+**Section 2 — User Experience**
+
+- **"Daily change %"** is listed in the watchlist panel spec, but the simulator generates prices from seed values and has no concept of a "daily open." How should this be computed? Options: (a) percent change from the seed price at startup, (b) percent change from the first price received in the current SSE session, (c) drop the column and show change since page load instead. Without clarification, agents will implement this differently.
+- **Sparklines reset on refresh** — sparklines accumulate from SSE since page load, so a browser refresh wipes them. Is this intentional? If the data should persist, `portfolio_snapshots` could seed initial sparkline data; if it's intentional (clean-slate on reload), say so explicitly.
+- **Empty heatmap state** — if the user has no positions (fresh start with $10k cash), the heatmap treemap is empty. Should it show a placeholder, or show cash as a single rectangle?
+
+**Section 6 — Market Data**
+
+- **SSE cadence vs. Massive API polling cadence mismatch** — SSE pushes at ~500ms but Massive free tier polls every 15 seconds. This means clients receive the same price ~30 times between real updates. Should the SSE stream suppress duplicate prices, or is the constant push intentional (to keep the "live" feel even with stale data)?
+- **Watchlist growth without reconnection** — if the user adds a ticker after the SSE connection is established, does the stream automatically include it on the next tick, or does the client need to reconnect? The plan says SSE pushes "all tickers known to the system" — clarify whether the stream is dynamic (reflects live watchlist state) or static (set at connection time).
+
+**Section 7 — Database**
+
+- **`chat_messages.actions` JSON shape** — the column stores executed actions as JSON, but the schema for that JSON is never defined. The structured output schema in §9 shows what the LLM *requests*, but the stored `actions` should reflect what was actually *executed* (including failures). Agents need a concrete definition for this field to interoperate.
+- **Conversation history window** — §9 says the backend loads "recent conversation history" but doesn't specify how many messages. Without a limit, a long session could overflow the LLM context window. Recommend specifying a fixed count (e.g., last 20 messages) or token budget.
+
+**Section 8 — API Endpoints**
+
+- **`POST /api/portfolio/trade` response shape** — the spec defines the request `{ticker, quantity, side}` but not the response. Should it return the updated position, new cash balance, and the trade record? Agents implementing the frontend need this contract.
+- **Price lookup for new watchlist additions** — `GET /api/watchlist` returns tickers with latest prices, but what is returned for a ticker just added that isn't yet in the price cache (e.g., added mid-polling-interval with Massive API)? Specify a fallback (null price, 0, or omit it).
+- **No single-ticker price endpoint** — the trade bar needs to display the current price for any ticker the user types before executing. Currently there's no endpoint for this. Options: (a) add `GET /api/prices/{ticker}`, (b) rely on SSE stream state on the frontend, (c) have the watchlist endpoint serve as a price oracle.
+
+**Section 9 — LLM Integration**
+
+- **`watchlist_changes` schema is incomplete** — the example only shows `action: "add"`. The text says the AI can also remove tickers. The schema should explicitly show both: `{"ticker": "PYPL", "action": "add" | "remove"}`.
+- **Mock response spec is undefined** — §9 mentions `LLM_MOCK=true` returns deterministic responses, but never specifies what those responses contain. The E2E tests in §12 depend on this behavior (e.g., "trade execution appears inline"). Either define a fixed mock payload here or reference a separate fixture file.
+- **"cerebras-inference skill" is a meta-instruction** — §9.4 says "using the cerebras-inference skill." This is an instruction to the coding agent, not runtime behavior. It should be separated from the runtime spec, or at least parenthetically clarified as a developer tool reference.
+
+**Section 10 — Frontend Design**
+
+- **Charting library ambiguity** — two libraries are suggested (Lightweight Charts and Recharts) with different rendering models (canvas vs. SVG). Agents should pick one upfront. Recommendation: **Lightweight Charts** (TradingView) — it handles time-series data and streaming updates more naturally for a trading terminal aesthetic, and the plan explicitly prefers canvas-based.
+- **Trade bar ticker scope** — should the ticker input accept any symbol, or only tickers already on the watchlist? If any symbol is accepted, what happens if the price isn't in the cache? Define the validation behavior.
+- **Chat panel default state** — described as "docked/collapsible" but no default state specified. Should it be open on first load?
+
+---
+
+### Simplification Opportunities
+
+1. **UUID primary keys on `watchlist` and `positions`** — both tables have a UUID `id` PK that is never referenced in any API endpoint or foreign key. The UNIQUE constraint on `(user_id, ticker)` already uniquely identifies rows. Using `(user_id, ticker)` as a composite PK would remove a UUID generation step and clarify intent. Low-effort change with no functional impact for single-user.
+
+2. **UUID primary keys on `trades`, `portfolio_snapshots`, `chat_messages`** — similarly, these are append-only tables where rows are queried by time range or user, never by `id`. SQLite auto-increment integers (`INTEGER PRIMARY KEY`) are simpler, faster, and self-documenting for ordered data. UUIDs here buy nothing in a single-user embedded database.
+
+3. **Massive API as a true stretch goal** — the Massive integration is marked "optional" but still gets a full spec (polling intervals, tier logic, interface contract). For agents generating code, this doubles the market data surface area. Consider explicitly deferring it post-MVP so agents focus on the simulator path and don't over-engineer the interface abstraction upfront.
+
+4. **`docker-compose.yml` is described as an "optional convenience wrapper"** without any specification. Either spec it (what services, volumes, env) or remove the reference — as-written, agents may generate inconsistent files.
+
+5. **Test infrastructure complexity** — the E2E setup (separate `docker-compose.test.yml` + Playwright container) is production-grade CI infrastructure that takes meaningful agent effort. For a course demo, running Playwright locally against `localhost:8000` is simpler. Consider making the Docker-based test setup an explicit stretch goal, with a simpler `npm run test:e2e` path as the baseline.
+
+6. **`portfolio_snapshots` background task interval (30s)** — the P&L chart is driven by this data, but the chart will be very sparse at 30s intervals during a short demo session. Consider 5–10s as the default, or recording a snapshot on every SSE tick (every 500ms). The table is lightweight enough to handle it.
+
+7. **`users_profile` table** — with a single hardcoded user, this table will always have exactly one row. If multi-user is truly out of scope, the cash balance could live in the `positions` table or as a config value, removing one table. That said, keeping it as a single-row table is fine if the multi-user forward-compatibility argument is load-bearing.
